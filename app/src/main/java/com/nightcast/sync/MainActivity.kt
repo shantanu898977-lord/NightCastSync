@@ -597,7 +597,6 @@ class MainActivity : AppCompatActivity() {
         val maxW = if (isLandscape) longSideCap else shortSideCap
         val maxH = if (isLandscape) shortSideCap else longSideCap
 
-        // Never upscale above native resolution; scale down smoothly to selected quality ceiling
         val scale = minOf(1.0f, maxW.toFloat() / rawW.toFloat(), maxH.toFloat() / rawH.toFloat())
         val alignedW = (((rawW * scale).toInt() / 16) * 16).coerceAtLeast(320)
         val alignedH = (((rawH * scale).toInt() / 16) * 16).coerceAtLeast(240)
@@ -609,10 +608,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun getBitrateForQuality(shortSide: Int): Int {
         return when {
-            shortSide <= 360 -> 900_000    // 0.9 Mbps (Ultra-fast, zero lag on any Wi-Fi)
-            shortSide <= 480 -> 1_500_000  // 1.5 Mbps (DVD smoothness)
-            shortSide <= 720 -> 2_600_000  // 2.6 Mbps (HD clarity without Wi-Fi spikes)
-            else -> 4_500_000              // 4.5 Mbps (1080p Full HD ceiling)
+            shortSide <= 360 -> 900_000
+            shortSide <= 480 -> 1_500_000
+            shortSide <= 720 -> 2_600_000
+            else -> 4_500_000
         }
     }
 
@@ -707,7 +706,7 @@ class MainActivity : AppCompatActivity() {
         val muxer = Fmp4StreamMuxer(width, height, maxFps)
         val batchBuffer = ByteArrayOutputStream()
         var lastBatchFlushMs = SystemClock.elapsedRealtime()
-        varcongestionEvents = 0
+        var congestionEvents = 0
 
         while (isMirroring && mediaCodec === codec) {
             try {
@@ -747,24 +746,22 @@ class MainActivity : AppCompatActivity() {
                     codec.releaseOutputBuffer(outputIndex, false)
                 }
 
-                // Flush accumulated frames every 45ms (~22 batches/sec) to keep Wi-Fi and TV browser smooth
                 val now = SystemClock.elapsedRealtime()
                 if (batchBuffer.size() > 0 && (now - lastBatchFlushMs >= 45 || batchBuffer.size() >= 48 * 1024)) {
                     val sentCleanly = wsServer?.broadcastBatch(batchBuffer.toByteArray()) ?: true
                     batchBuffer.reset()
                     lastBatchFlushMs = now
 
-                    // If Auto Quality is selected and Wi-Fi is congested, step down smoothly
                     if (!sentCleanly && selectedQualityHeight == 0 && autoTargetHeight > 360) {
-                        varcongestionEvents++
-                        if (varcongestionEvents >= 6) {
-                            varcongestionEvents = 0
+                        congestionEvents++
+                        if (congestionEvents >= 6) {
+                            congestionEvents = 0
                             autoTargetHeight = if (autoTargetHeight == 720) 480 else 360
                             mainHandler.post { if (isMirroring) restartEncoderLive() }
                             break
                         }
-                    } else if (sentCleanly && varcongestionEvents > 0) {
-                        varcongestionEvents--
+                    } else if (sentCleanly && congestionEvents > 0) {
+                        congestionEvents--
                     }
                 }
             } catch (_: Exception) {
@@ -1024,7 +1021,6 @@ class MainActivity : AppCompatActivity() {
                       const end = v.buffered.end(v.buffered.length - 1);
                       const bufferedAhead = end - v.currentTime;
 
-                      // Wait for a 220ms cushion before starting playback so it never underruns
                       if (!hasStartedPlayback && bufferedAhead >= 0.22) {
                         hasStartedPlayback = true;
                         v.play().catch(()=>{});
@@ -1032,13 +1028,10 @@ class MainActivity : AppCompatActivity() {
                         v.play().catch(()=>{});
                       }
 
-                      // Keep native 1.0x speed so Tizen hardware decoder never re-clocks/stutters.
-                      // Only jump if lag exceeds 2.0 seconds, keeping a safe 0.30s buffer cushion.
                       if (bufferedAhead > 2.0) {
                         v.currentTime = end - 0.30;
                       }
 
-                      // Trim old buffer only once every 30 seconds
                       if (v.currentTime > 45 && !sb.updating && queue.length === 0) {
                         try {
                           isRemoving = true;
@@ -1426,11 +1419,6 @@ class StreamWebSocketServer(
     }
 }
 
-/**
- * Gapless 1-Frame Lookahead fMP4 Muxer.
- * Guarantees that every frame's duration equals the exact time until the next frame,
- * eliminating timeline holes across 24 FPS, 30 FPS, and 60 FPS videos.
- */
 class Fmp4StreamMuxer(
     private val width: Int,
     private val height: Int,
