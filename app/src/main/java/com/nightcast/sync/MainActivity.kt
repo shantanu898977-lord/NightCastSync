@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
+import android.database.Cursor
 import android.graphics.Color
 import android.graphics.Typeface
 import android.hardware.display.DisplayManager
@@ -25,6 +26,8 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
+import android.provider.OpenableColumns
 import android.text.format.Formatter
 import android.util.DisplayMetrics
 import android.util.TypedValue
@@ -60,6 +63,7 @@ import kotlin.math.abs
 class MainActivity : AppCompatActivity() {
 
     private var selectedVideoUri: Uri? = null
+    @Volatile private var selectedVideoVersion: Long = 0L
     private var mediaPlayer: MediaPlayer? = null
     private var httpServer: ServerSocket? = null
     private var wsServer: StreamWebSocketServer? = null
@@ -70,8 +74,9 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var tvPlaybackTimeMs: Long = 0
     @Volatile private var tvIsPlaying: Boolean = false
     @Volatile private var pendingTvCommand: String? = null
+    @Volatile private var currentZoomMode: String = "cover"
 
-    // Hardware Encoder Pipeline (Capped at 1080p 60FPS for Snapdragon 695)
+    // Hardware Encoder Pipeline
     private lateinit var projectionManager: MediaProjectionManager
     private lateinit var displayManager: DisplayManager
     private var mediaProjection: MediaProjection? = null
@@ -81,6 +86,9 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var isMirroring = false
     @Volatile private var currentMode = MODE_OFFLINE_FILE
     private var lastIsLandscape: Boolean? = null
+
+    // Quality Preset: 0 = 720p 60FPS (Smooth Default), 1 = 1080p 60FPS (Max Sharpness), 2 = 720p 30FPS (Weak Wi-Fi)
+    @Volatile private var qualityPreset = 0
 
     private var audioOffsetMs: Long = 0
     private lateinit var prefs: SharedPreferences
@@ -103,17 +111,11 @@ class MainActivity : AppCompatActivity() {
         private const val REQUEST_PICK_FILE = 1001
         const val HTTP_PORT = 8080
         const val WS_PORT = 8088
-
-        private const val MAX_LONG_SIDE = 1920
-        private const val MAX_SHORT_SIDE = 1080
-        private const val MAX_FPS = 60
     }
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
-            mainHandler.post {
-                stopMirroring()
-            }
+            mainHandler.post { stopMirroring() }
         }
     }
 
@@ -125,9 +127,14 @@ class MainActivity : AppCompatActivity() {
             val metrics = getRealScreenMetrics()
             val nowLandscape = metrics.widthPixels >= metrics.heightPixels
             if (lastIsLandscape != null && lastIsLandscape != nowLandscape) {
-                mainHandler.post { restartEncoderForOrientation() }
+                mainHandler.removeCallbacks(orientationRestartRunnable)
+                mainHandler.postDelayed(orientationRestartRunnable, 250)
             }
         }
+    }
+
+    private val orientationRestartRunnable = Runnable {
+        if (isMirroring) restartEncoderAndVirtualDisplay()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -155,7 +162,7 @@ class MainActivity : AppCompatActivity() {
 
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(20), dp(20), dp(20))
+            setPadding(dp(18), dp(18), dp(18), dp(18))
             gravity = Gravity.CENTER_HORIZONTAL
         }
 
@@ -170,20 +177,58 @@ class MainActivity : AppCompatActivity() {
 
         ipText = TextView(this).apply {
             val ip = getLocalIpAddress()
-            text = "Open on Samsung TV:\nhttp://$ip:$HTTP_PORT"
+            text = "Open on Samsung TV Browser:\nhttp://$ip:$HTTP_PORT"
             setTextColor(Color.parseColor("#FFD54F"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             typeface = Typeface.MONOSPACE
             gravity = Gravity.CENTER
             setBackgroundColor(Color.parseColor("#1E1E1E"))
-            setPadding(dp(16), dp(12), dp(16), dp(12))
+            setPadding(dp(14), dp(12), dp(14), dp(12))
             val params = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, dp(12), 0, dp(16)) }
+            ).apply { setMargins(0, dp(10), 0, dp(14)) }
             layoutParams = params
         }
         layout.addView(ipText)
+
+        // TV Screen Size / Zoom Selector (Works for both Live Mirror & Offline Movies)
+        val zoomTitle = TextView(this).apply {
+            text = "TV Screen Size (Removes Black Bars):"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, dp(6))
+        }
+        layout.addView(zoomTitle)
+
+        val zoomRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, dp(14))
+        }
+
+        fun makeZoomBtn(label: String, mode: String): Button {
+            return Button(this).apply {
+                text = label
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setBackgroundColor(Color.parseColor("#37474F"))
+                val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                lp.setMargins(dp(3), 0, dp(3), 0)
+                layoutParams = lp
+                setOnClickListener {
+                    currentZoomMode = mode
+                    wsServer?.sendCommand("ZOOM:$mode")
+                    pendingTvCommand = "ZOOM:$mode"
+                }
+            }
+        }
+        zoomRow.addView(makeZoomBtn("Fill TV", "cover"))
+        zoomRow.addView(makeZoomBtn("Cinema+", "cinema"))
+        zoomRow.addView(makeZoomBtn("Stretch", "fill"))
+        zoomRow.addView(makeZoomBtn("Fit All", "contain"))
+        layout.addView(zoomRow)
 
         val modeTitle = TextView(this).apply {
             text = "Choose Operating Mode:"
@@ -197,7 +242,7 @@ class MainActivity : AppCompatActivity() {
         modeRadioGroup = RadioGroup(this).apply {
             orientation = RadioGroup.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(0, 0, 0, dp(16))
+            setPadding(0, 0, 0, dp(14))
         }
 
         val radioOffline = RadioButton(this).apply {
@@ -207,7 +252,7 @@ class MainActivity : AppCompatActivity() {
             isChecked = true
         }
         val radioMirror = RadioButton(this).apply {
-            text = "Live Mirror (Up to 1080p 60FPS)"
+            text = "Live Mirror (Online)"
             setTextColor(Color.WHITE)
             id = View.generateViewId()
         }
@@ -215,14 +260,14 @@ class MainActivity : AppCompatActivity() {
         modeRadioGroup.addView(radioMirror)
         layout.addView(modeRadioGroup)
 
-        // Offline Movie Controls
+        // ==================== OFFLINE MOVIE CONTROLS ====================
         offlineControlsLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
         }
 
         val selectBtn = Button(this).apply {
-            text = "Select Movie File"
+            text = "Select Movie File (.MP4)"
             setBackgroundColor(Color.parseColor("#1E88E5"))
             setTextColor(Color.WHITE)
             setOnClickListener { openFilePicker() }
@@ -233,9 +278,22 @@ class MainActivity : AppCompatActivity() {
             text = "No movie selected"
             setTextColor(Color.parseColor("#80D8FF"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            gravity = Gravity.CENTER
             setPadding(0, dp(8), 0, dp(8))
         }
         offlineControlsLayout.addView(statusText)
+
+        val transportRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+
+        val rewindBtn = Button(this).apply {
+            text = "-15s"
+            setBackgroundColor(Color.parseColor("#455A64"))
+            setTextColor(Color.WHITE)
+            setOnClickListener { pendingTvCommand = "SEEK:-15" }
+        }
 
         playPauseButton = Button(this).apply {
             text = "Pause"
@@ -254,7 +312,18 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-        offlineControlsLayout.addView(playPauseButton)
+
+        val forwardBtn = Button(this).apply {
+            text = "+15s"
+            setBackgroundColor(Color.parseColor("#455A64"))
+            setTextColor(Color.WHITE)
+            setOnClickListener { pendingTvCommand = "SEEK:+15" }
+        }
+
+        transportRow.addView(rewindBtn)
+        transportRow.addView(playPauseButton)
+        transportRow.addView(forwardBtn)
+        offlineControlsLayout.addView(transportRow)
 
         val syncTitle = TextView(this).apply {
             text = "Earphone Audio Delay Offset"
@@ -308,19 +377,61 @@ class MainActivity : AppCompatActivity() {
         offlineControlsLayout.addView(stepRow)
         layout.addView(offlineControlsLayout)
 
-        // Live Mirror Controls
+        // ==================== LIVE MIRROR CONTROLS ====================
         mirrorControlsLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
             visibility = View.GONE
         }
 
-        val mirrorNotice = TextView(this).apply {
-            text = "Hardware H.264 Stream (Max 1080p @ 60FPS).\nSupports anything up to 1080p60.\nAudio stays in your wired earphones."
-            setTextColor(Color.parseColor("#B0BEC5"))
+        val qualityLabel = TextView(this).apply {
+            text = "Stream Smoothness / Resolution:"
+            setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, dp(4))
+        }
+        mirrorControlsLayout.addView(qualityLabel)
+
+        val qualityGroup = RadioGroup(this).apply {
+            orientation = RadioGroup.VERTICAL
+            setPadding(0, 0, 0, dp(10))
+        }
+        val q720p60 = RadioButton(this).apply {
+            text = "720p @ 60FPS (Recommended - Zero Lag)"
+            setTextColor(Color.WHITE)
+            id = View.generateViewId()
+            isChecked = true
+        }
+        val q1080p60 = RadioButton(this).apply {
+            text = "1080p @ 60FPS (Max Sharpness - Fast 5GHz Wi-Fi)"
+            setTextColor(Color.WHITE)
+            id = View.generateViewId()
+        }
+        val q720p30 = RadioButton(this).apply {
+            text = "720p @ 30FPS (Data Saver / Weak Wi-Fi)"
+            setTextColor(Color.WHITE)
+            id = View.generateViewId()
+        }
+        qualityGroup.addView(q720p60)
+        qualityGroup.addView(q1080p60)
+        qualityGroup.addView(q720p30)
+        qualityGroup.setOnCheckedChangeListener { _, checkedId ->
+            qualityPreset = when (checkedId) {
+                q1080p60.id -> 1
+                q720p30.id -> 2
+                else -> 0
+            }
+            if (isMirroring) restartEncoderAndVirtualDisplay()
+        }
+        mirrorControlsLayout.addView(qualityGroup)
+
+        val mirrorNotice = TextView(this).apply {
+            text = "Tip: Rotate your phone horizontally (Fullscreen in browser) and tap 'Fill TV' or 'Cinema+' above so the movie fills the entire TV screen."
+            setTextColor(Color.parseColor("#B0BEC5"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             gravity = Gravity.CENTER
-            setPadding(0, 0, 0, dp(12))
+            setPadding(0, 0, 0, dp(10))
         }
         mirrorControlsLayout.addView(mirrorNotice)
 
@@ -384,16 +495,18 @@ class MainActivity : AppCompatActivity() {
         if (requestCode == REQUEST_PICK_FILE && resultCode == Activity.RESULT_OK) {
             val uri = data?.data ?: return
             selectedVideoUri = uri
+            selectedVideoVersion = System.currentTimeMillis()
             try {
                 contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
             } catch (_: Exception) {}
-            statusText.text = "Loaded: ${uri.lastPathSegment ?: "Movie ready"}"
+            val name = getFileName(uri)
+            statusText.text = "Loaded: $name\n(TV will auto-start within 1 second)"
             initLocalAudioPlayer(uri)
+            pendingTvCommand = "RELOAD"
         } else if (requestCode == REQUEST_MEDIA_PROJECTION && resultCode == Activity.RESULT_OK && data != null) {
             mirrorStatusText.text = "Starting foreground service..."
             mirrorStatusText.setTextColor(Color.parseColor("#FFD54F"))
 
-            // Wait until ProjectionService confirms startForeground() before calling getMediaProjection()
             ProjectionService.onForegroundReady = {
                 mainHandler.post {
                     try {
@@ -423,6 +536,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun getFileName(uri: Uri): String {
+        var result: String? = null
+        if (uri.scheme == "content") {
+            val cursor: Cursor? = contentResolver.query(uri, null, null, null, null)
+            cursor.use { c ->
+                if (c != null && c.moveToFirst()) {
+                    val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) result = c.getString(idx)
+                }
+            }
+        }
+        return result ?: uri.lastPathSegment ?: "Movie.mp4"
+    }
+
     @Suppress("DEPRECATION")
     private fun getRealScreenMetrics(): DisplayMetrics {
         val metrics = DisplayMetrics()
@@ -431,67 +558,96 @@ class MainActivity : AppCompatActivity() {
     }
 
     @Suppress("DEPRECATION")
-    private fun getCappedFps(): Int {
-        val refreshRate = windowManager.defaultDisplay?.refreshRate?.toInt() ?: 60
-        return refreshRate.coerceIn(24, MAX_FPS)
-    }
-
-    private fun computeCappedDimensions(metrics: DisplayMetrics): Pair<Int, Int> {
+    private fun computeStreamParameters(metrics: DisplayMetrics): Triple<Int, Int, Int> {
         val rawW = metrics.widthPixels
         val rawH = metrics.heightPixels
         val isLandscape = rawW >= rawH
         lastIsLandscape = isLandscape
 
-        val maxW = if (isLandscape) MAX_LONG_SIDE else MAX_SHORT_SIDE
-        val maxH = if (isLandscape) MAX_SHORT_SIDE else MAX_LONG_SIDE
+        val maxLong = if (qualityPreset == 1) 1920 else 1280
+        val maxShort = if (qualityPreset == 1) 1080 else 720
+        val targetFps = if (qualityPreset == 2) 30 else 60
+
+        val maxW = if (isLandscape) maxLong else maxShort
+        val maxH = if (isLandscape) maxShort else maxLong
 
         val scale = minOf(1.0f, maxW.toFloat() / rawW.toFloat(), maxH.toFloat() / rawH.toFloat())
-        val cappedW = (((rawW * scale).toInt() / 2) * 2).coerceAtLeast(320)
-        val cappedH = (((rawH * scale).toInt() / 2) * 2).coerceAtLeast(240)
-        return Pair(cappedW, cappedH)
+        // Align to 16-pixel macroblock boundaries for hardware H.264 encoder speed
+        val alignedW = (((rawW * scale).toInt() / 16) * 16).coerceAtLeast(320)
+        val alignedH = (((rawH * scale).toInt() / 16) * 16).coerceAtLeast(240)
+
+        val refreshRate = windowManager.defaultDisplay?.refreshRate?.toInt() ?: 60
+        val fps = refreshRate.coerceIn(24, targetFps)
+        return Triple(alignedW, alignedH, fps)
+    }
+
+    private fun createConfiguredEncoder(width: Int, height: Int, fps: Int, bitrate: Int): MediaCodec {
+        val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        try {
+            // Try Low-Latency Baseline Profile (0 B-frames) first for zero decode jitter on Samsung TV
+            val lowLatencyFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+                setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+                setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel41)
+                setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                }
+                setInteger(MediaFormat.KEY_PRIORITY, 0)
+            }
+            codec.configure(lowLatencyFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            return codec
+        } catch (_: Exception) {
+            // Fallback to standard format if chipset rejects explicit profile flags
+            val basicFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+                setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
+            }
+            codec.configure(basicFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            return codec
+        }
     }
 
     private fun startHardwareMirroring() {
         val metrics = getRealScreenMetrics()
-        val (width, height) = computeCappedDimensions(metrics)
-        val fps = getCappedFps()
-        val pixelRatio = (width * height).toFloat() / (1920f * 1080f)
-        val bitrate = (8_000_000f * pixelRatio).toInt().coerceIn(2_000_000, 8_000_000)
-
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        val (width, height, fps) = computeStreamParameters(metrics)
+        val bitrate = when (qualityPreset) {
+            1 -> 6_000_000 // 6 Mbps for 1080p60
+            2 -> 2_500_000 // 2.5 Mbps for 720p30
+            else -> 4_000_000 // 4 Mbps for 720p60 (Fast & sharp)
         }
 
         try {
             wsServer?.clearStreamCache()
-            val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            val codec = createConfiguredEncoder(width, height, fps, bitrate)
             val surface = codec.createInputSurface()
             codec.start()
 
             mediaCodec = codec
             encoderSurface = surface
 
-            if (virtualDisplay == null) {
-                virtualDisplay = mediaProjection?.createVirtualDisplay(
-                    "MovieCastHwMirror",
-                    width, height, metrics.densityDpi,
-                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                    surface, null, null
-                )
-            } else {
-                virtualDisplay?.resize(width, height, metrics.densityDpi)
-                virtualDisplay?.surface = surface
-            }
+            // Always recreate VirtualDisplay cleanly so orientation changes never letterbox inside portrait
+            virtualDisplay?.release()
+            virtualDisplay = mediaProjection?.createVirtualDisplay(
+                "MovieCastHwMirror",
+                width, height, metrics.densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                surface, null, null
+            )
 
             isMirroring = true
             toggleMirrorBtn.text = "Stop Screen Mirroring"
-            mirrorStatusText.text = "Mirroring: Active (${width}x${height} @ ${fps}FPS)"
+            val orientLabel = if (width >= height) "Landscape" else "Portrait"
+            mirrorStatusText.text = "Active: ${width}x${height} ($orientLabel) @ ${fps}FPS"
             mirrorStatusText.setTextColor(Color.parseColor("#4CAF50"))
 
+            wsServer?.sendCommand("ZOOM:$currentZoomMode")
             threadPool.execute { drainEncoder(codec, width, height, fps) }
 
         } catch (e: Exception) {
@@ -501,10 +657,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun restartEncoderForOrientation() {
+    private fun restartEncoderAndVirtualDisplay() {
         if (!isMirroring) return
         isMirroring = false
         try {
+            virtualDisplay?.release()
+            virtualDisplay = null
             mediaCodec?.stop()
             mediaCodec?.release()
             mediaCodec = null
@@ -548,7 +706,7 @@ class MainActivity : AppCompatActivity() {
                             if (muxer.isInitialized) {
                                 val fragment = muxer.wrapFrame(rawData, bufferInfo.presentationTimeUs, isKeyFrame)
                                 if (fragment != null) {
-                                    wsServer?.broadcastData(fragment)
+                                    wsServer?.broadcastVideoFragment(fragment, isKeyFrame)
                                 }
                             }
                         }
@@ -593,6 +751,7 @@ class MainActivity : AppCompatActivity() {
             try {
                 wsServer = StreamWebSocketServer(InetSocketAddress(WS_PORT)).apply {
                     isReuseAddr = true
+                    isTcpNoDelay = true
                     start()
                 }
             } catch (_: Exception) {}
@@ -600,14 +759,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun initLocalAudioPlayer(uri: Uri) {
-        mediaPlayer?.release()
-        mediaPlayer = MediaPlayer().apply {
-            setDataSource(this@MainActivity, uri)
-            isLooping = false
-            prepare()
+        try {
+            mediaPlayer?.release()
+            mediaPlayer = MediaPlayer().apply {
+                setDataSource(this@MainActivity, uri)
+                isLooping = false
+                prepare()
+            }
+            playPauseButton.visibility = View.VISIBLE
+            playPauseButton.text = "Pause"
+        } catch (e: Exception) {
+            statusText.text = "Audio error: ${e.message}"
         }
-        playPauseButton.visibility = View.VISIBLE
-        playPauseButton.text = "Pause"
     }
 
     private fun forceSyncNow() {
@@ -629,7 +792,7 @@ class MainActivity : AppCompatActivity() {
                     val targetMs = (tvPlaybackTimeMs - audioOffsetMs).coerceAtLeast(0)
                     val currentAudioMs = player.currentPosition.toLong()
                     val diff = abs(currentAudioMs - targetMs)
-                    if (diff > 80) player.seekTo(targetMs.toInt())
+                    if (diff > 90) player.seekTo(targetMs.toInt())
                     if (tvIsPlaying && !player.isPlaying) {
                         player.start()
                         playPauseButton.text = "Pause"
@@ -650,6 +813,7 @@ class MainActivity : AppCompatActivity() {
                 httpServer = ServerSocket(HTTP_PORT)
                 while (isServerRunning) {
                     val client = httpServer?.accept() ?: break
+                    client.tcpNoDelay = true
                     threadPool.execute { handleHttpRequest(client) }
                 }
             } catch (_: Exception) {}
@@ -698,54 +862,142 @@ class MainActivity : AppCompatActivity() {
               <meta name="viewport" content="width=device-width, initial-scale=1">
               <title>Movie Cast</title>
               <style>
-                body, html { margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden; font-family:sans-serif; text-align:center; }
-                video { width:100%; height:100%; object-fit:contain; }
-                .nav { position:fixed; top:10px; right:10px; z-index:99; background:rgba(0,0,0,0.6); padding:8px 12px; border-radius:6px; }
-                .nav a { color:#fff; text-decoration:none; margin:0 8px; font-weight:bold; }
+                body, html { margin:0; padding:0; width:100vw; height:100vh; background:#000; overflow:hidden; font-family:sans-serif; }
+                #stage { width:100vw; height:100vh; display:flex; align-items:center; justify-content:center; overflow:hidden; background:#000; }
+                video { width:100vw; height:100vh; object-fit:cover; background:#000; transition:transform 0.2s ease; }
+                .nav { position:fixed; top:12px; right:12px; z-index:99; background:rgba(15,15,15,0.85); padding:8px 14px; border-radius:8px; transition:opacity 0.4s; color:#fff; font-size:14px; }
+                .nav a, .nav span { color:#fff; text-decoration:none; margin:0 6px; font-weight:bold; cursor:pointer; padding:4px 8px; border-radius:4px; background:#263238; }
+                .nav.hidden { opacity:0; pointer-events:none; }
+                #statusOverlay { position:fixed; bottom:20px; left:20px; color:#80D8FF; background:rgba(0,0,0,0.7); padding:8px 14px; border-radius:6px; font-size:14px; display:none; z-index:90; }
               </style>
             </head>
             <body>
-              <div class="nav">
-                <a href="/?view=file">Offline Movie</a> | 
-                <a href="/?view=mirror">Live Screen Mirror</a>
+              <div class="nav" id="navbar">
+                <a href="/?view=file">Offline Movie</a>
+                <a href="/?view=mirror">Live Mirror</a>
+                <span onclick="applyZoom('cover')">Fill TV</span>
+                <span onclick="applyZoom('cinema')">Cinema+</span>
+                <span onclick="applyZoom('fill')">Stretch</span>
+                <span onclick="applyZoom('contain')">Fit</span>
               </div>
+              <div id="statusOverlay">Waiting for stream...</div>
+              <div id="stage"><video id="v" autoplay playsinline muted></video></div>
               <script>
+                const v = document.getElementById('v');
+                const nav = document.getElementById('navbar');
+                const statusBox = document.getElementById('statusOverlay');
+                let navTimer = null;
+
+                function wakeNav() {
+                  nav.classList.remove('hidden');
+                  clearTimeout(navTimer);
+                  navTimer = setTimeout(() => nav.classList.add('hidden'), 4000);
+                }
+                document.addEventListener('mousemove', wakeNav);
+                document.addEventListener('keydown', wakeNav);
+                document.addEventListener('click', wakeNav);
+                wakeNav();
+
+                function applyZoom(mode) {
+                  if (!v) return;
+                  if (mode === 'cinema') {
+                    v.style.objectFit = 'cover';
+                    v.style.transform = 'scale(1.16)';
+                  } else {
+                    v.style.objectFit = mode;
+                    v.style.transform = 'scale(1.0)';
+                  }
+                }
+                applyZoom('$currentZoomMode');
+
                 const p = new URLSearchParams(window.location.search);
                 const view = p.get('view') || (document.referrer.includes('mirror') ? 'mirror' : 'file');
+
                 if (view === 'mirror') {
-                  document.write('<video id="v" autoplay playsinline muted></video>');
-                  const v = document.getElementById('v');
-                  const ms = new MediaSource();
-                  v.src = URL.createObjectURL(ms);
+                  let ms = null;
                   let sb = null;
                   let pendingMime = null;
-                  const queue = [];
+                  let queue = [];
+                  let queueBytes = 0;
+                  let isRemoving = false;
 
-                  function flushQueue() {
-                    if (!sb || sb.updating || queue.length === 0) return;
+                  function setupMediaSource() {
+                    queue = [];
+                    queueBytes = 0;
+                    sb = null;
+                    isRemoving = false;
+                    ms = new MediaSource();
+                    v.src = URL.createObjectURL(ms);
+                    ms.addEventListener('sourceopen', () => {
+                      if (pendingMime) initSourceBuffer(pendingMime);
+                    });
+                  }
+
+                  function initSourceBuffer(mime) {
+                    if (sb || !ms || ms.readyState !== 'open') return;
                     try {
-                      sb.appendBuffer(queue.shift());
-                      if (v.buffered.length > 0) {
-                        const end = v.buffered.end(v.buffered.length - 1);
-                        if (end - v.currentTime > 0.35) v.currentTime = end - 0.05;
-                        if (v.currentTime > 15 && !sb.updating) {
-                          sb.remove(0, v.currentTime - 5);
-                        }
-                      }
+                      sb = ms.addSourceBuffer(mime);
+                      sb.mode = 'segments';
+                      sb.addEventListener('updateend', onBufferUpdated);
+                      flushQueue();
                     } catch (e) {}
                   }
 
-                  function initBuffer(mime) {
-                    if (sb || ms.readyState !== 'open') return;
-                    sb = ms.addSourceBuffer(mime);
-                    sb.mode = 'segments';
-                    sb.addEventListener('updateend', flushQueue);
+                  function onBufferUpdated() {
+                    isRemoving = false;
+                    if (v.paused) v.play().catch(()=>{});
+                    if (v.buffered.length > 0) {
+                      const end = v.buffered.end(v.buffered.length - 1);
+                      const lag = end - v.currentTime;
+                      if (lag > 1.8) {
+                        v.currentTime = end - 0.15;
+                        v.playbackRate = 1.0;
+                      } else if (lag > 0.40) {
+                        v.playbackRate = 1.10;
+                      } else if (lag > 0.18) {
+                        v.playbackRate = 1.04;
+                      } else {
+                        v.playbackRate = 1.0;
+                      }
+
+                      if (v.currentTime > 25 && !sb.updating && queue.length === 0) {
+                        try {
+                          isRemoving = true;
+                          sb.remove(0, v.currentTime - 10);
+                          return;
+                        } catch (e) { isRemoving = false; }
+                      }
+                    }
                     flushQueue();
                   }
 
-                  ms.addEventListener('sourceopen', () => {
-                    if (pendingMime) initBuffer(pendingMime);
-                  });
+                  function flushQueue() {
+                    if (!sb || sb.updating || isRemoving || queue.length === 0) return;
+                    try {
+                      // Merge all queued fragments into a single appendBuffer call to eliminate TV CPU lag
+                      let payload;
+                      if (queue.length === 1) {
+                        payload = queue.shift();
+                        queueBytes = 0;
+                      } else {
+                        const merged = new Uint8Array(queueBytes);
+                        let offset = 0;
+                        while (queue.length > 0) {
+                          const chunk = new Uint8Array(queue.shift());
+                          merged.set(chunk, offset);
+                          offset += chunk.byteLength;
+                        }
+                        queueBytes = 0;
+                        payload = merged.buffer;
+                      }
+                      sb.appendBuffer(payload);
+                    } catch (e) {
+                      queue = [];
+                      queueBytes = 0;
+                    }
+                  }
+
+                  setupMediaSource();
 
                   function connectWs() {
                     const ws = new WebSocket('ws://$ip:$WS_PORT');
@@ -753,35 +1005,66 @@ class MainActivity : AppCompatActivity() {
                     ws.onmessage = (e) => {
                       if (typeof e.data === 'string') {
                         if (e.data.startsWith('MIME:')) {
-                          const mime = e.data.substring(5);
-                          if (!sb) {
-                            pendingMime = mime;
-                            initBuffer(mime);
-                          }
+                          pendingMime = e.data.substring(5);
+                          initSourceBuffer(pendingMime);
                         } else if (e.data === 'RESET') {
-                          location.reload();
+                          setupMediaSource();
+                        } else if (e.data.startsWith('ZOOM:')) {
+                          applyZoom(e.data.substring(5));
                         }
                       } else {
-                        if (queue.length > 30) queue.shift();
+                        if (queue.length > 45) {
+                          queue = [];
+                          queueBytes = 0;
+                        }
                         queue.push(e.data);
+                        queueBytes += e.data.byteLength;
                         flushQueue();
                       }
                     };
-                    ws.onclose = () => setTimeout(connectWs, 1000);
+                    ws.onclose = () => setTimeout(connectWs, 800);
                   }
                   connectWs();
+
                 } else {
-                  document.write('<video id="v" src="/video" autoplay muted playsinline controls></video>');
+                  v.controls = true;
+                  let currentVer = 0;
+                  function loadOfflineVideo(ver) {
+                    currentVer = ver;
+                    v.src = '/video?v=' + ver;
+                    v.load();
+                    v.play().catch(()=>{});
+                  }
+
                   setInterval(() => {
-                    const v = document.getElementById('v');
-                    if (!v) return;
-                    fetch('/sync?time=' + Math.floor(v.currentTime * 1000) + '&playing=' + (!v.paused && !v.ended))
+                    const t = Math.floor((v.currentTime || 0) * 1000);
+                    const playing = (!v.paused && !v.ended && v.readyState > 1);
+                    fetch('/sync?time=' + t + '&playing=' + playing)
                       .then(r => r.text())
-                      .then(cmd => {
+                      .then(resp => {
+                        const parts = resp.split('|');
+                        const cmd = parts[0];
+                        const serverVer = parseInt(parts[1] || '0', 10);
+                        if (serverVer > 0 && serverVer !== currentVer) {
+                          statusBox.style.display = 'none';
+                          loadOfflineVideo(serverVer);
+                          return;
+                        }
+                        if (serverVer === 0) {
+                          statusBox.innerText = 'Select a Movie File on your phone to start...';
+                          statusBox.style.display = 'block';
+                        }
                         if (cmd === 'PAUSE' && !v.paused) v.pause();
-                        if (cmd === 'PLAY' && v.paused) v.play();
+                        else if (cmd === 'PLAY' && v.paused) v.play().catch(()=>{});
+                        else if (cmd === 'RELOAD' && serverVer > 0) loadOfflineVideo(serverVer);
+                        else if (cmd.startsWith('SEEK:')) {
+                          const delta = parseInt(cmd.substring(5), 10);
+                          v.currentTime = Math.max(0, v.currentTime + delta);
+                        } else if (cmd.startsWith('ZOOM:')) {
+                          applyZoom(cmd.substring(5));
+                        }
                       }).catch(()=>{});
-                  }, 300);
+                  }, 350);
                 }
               </script>
             </body>
@@ -801,48 +1084,82 @@ class MainActivity : AppCompatActivity() {
         socket.close()
     }
 
+    private fun getVideoSize(uri: Uri): Long {
+        try {
+            contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                if (pfd.statSize > 0) return pfd.statSize
+            }
+        } catch (_: Exception) {}
+        try {
+            contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    val idx = c.getColumnIndex(OpenableColumns.SIZE)
+                    if (idx >= 0 && !c.isNull(idx)) return c.getLong(idx)
+                }
+            }
+        } catch (_: Exception) {}
+        return -1L
+    }
+
     private fun serveVideoFile(socket: Socket, rangeHeader: String?) {
         val uri = selectedVideoUri ?: return socket.close()
+        val totalLength = getVideoSize(uri)
         val pfd = contentResolver.openFileDescriptor(uri, "r") ?: return socket.close()
-        val totalLength = pfd.statSize
-        var start: Long = 0
-        var end: Long = totalLength - 1
 
-        if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
+        var start: Long = 0
+        var end: Long = if (totalLength > 0) totalLength - 1 else Long.MAX_VALUE
+
+        if (rangeHeader != null && rangeHeader.startsWith("bytes=") && totalLength > 0) {
             val parts = rangeHeader.removePrefix("bytes=").split("-")
             start = parts[0].toLongOrNull() ?: 0
             if (parts.size > 1 && parts[1].isNotEmpty()) {
                 end = parts[1].toLongOrNull() ?: (totalLength - 1)
             }
         }
-        val contentLength = end - start + 1
+
         val out = socket.getOutputStream()
         val writer = PrintWriter(out, false)
-        if (rangeHeader != null) {
-            writer.print("HTTP/1.1 206 Partial Content\r\n")
-            writer.print("Content-Range: bytes $start-$end/$totalLength\r\n")
+        if (totalLength > 0) {
+            val contentLength = end - start + 1
+            if (rangeHeader != null) {
+                writer.print("HTTP/1.1 206 Partial Content\r\n")
+                writer.print("Content-Range: bytes $start-$end/$totalLength\r\n")
+            } else {
+                writer.print("HTTP/1.1 200 OK\r\n")
+            }
+            writer.print("Content-Type: video/mp4\r\n")
+            writer.print("Accept-Ranges: bytes\r\n")
+            writer.print("Content-Length: $contentLength\r\n")
+            writer.print("Connection: close\r\n\r\n")
+            writer.flush()
+
+            FileInputStream(pfd.fileDescriptor).use { fis ->
+                if (start > 0) fis.channel.position(start)
+                val buffer = ByteArray(128 * 1024)
+                var remaining = contentLength
+                while (remaining > 0) {
+                    val toRead = minOf(buffer.size.toLong(), remaining).toInt()
+                    val read = fis.read(buffer, 0, toRead)
+                    if (read == -1) break
+                    out.write(buffer, 0, read)
+                    remaining -= read
+                }
+                out.flush()
+            }
         } else {
             writer.print("HTTP/1.1 200 OK\r\n")
+            writer.print("Content-Type: video/mp4\r\n")
+            writer.print("Connection: close\r\n\r\n")
+            writer.flush()
+            FileInputStream(pfd.fileDescriptor).use { fis ->
+                val buffer = ByteArray(128 * 1024)
+                var read: Int
+                while (fis.read(buffer).also { read = it } != -1) {
+                    out.write(buffer, 0, read)
+                }
+                out.flush()
+            }
         }
-        writer.print("Content-Type: video/mp4\r\n")
-        writer.print("Accept-Ranges: bytes\r\n")
-        writer.print("Content-Length: $contentLength\r\n")
-        writer.print("Connection: close\r\n\r\n")
-        writer.flush()
-
-        val fis = FileInputStream(pfd.fileDescriptor)
-        fis.channel.position(start)
-        val buffer = ByteArray(64 * 1024)
-        var remaining = contentLength
-        while (remaining > 0) {
-            val toRead = minOf(buffer.size.toLong(), remaining).toInt()
-            val read = fis.read(buffer, 0, toRead)
-            if (read == -1) break
-            out.write(buffer, 0, read)
-            remaining -= read
-        }
-        out.flush()
-        fis.close()
         pfd.close()
         socket.close()
     }
@@ -856,8 +1173,9 @@ class MainActivity : AppCompatActivity() {
         params["time"]?.toLongOrNull()?.let { tvPlaybackTimeMs = it }
         params["playing"]?.let { tvIsPlaying = (it == "true") }
 
-        val resp = pendingTvCommand ?: "OK"
+        val cmd = pendingTvCommand ?: "OK"
         pendingTvCommand = null
+        val resp = "$cmd|$selectedVideoVersion"
         val bytes = resp.toByteArray(Charsets.UTF_8)
         val out = socket.getOutputStream()
         val writer = PrintWriter(out, false)
@@ -893,12 +1211,16 @@ class MainActivity : AppCompatActivity() {
 
 class ProjectionService : Service() {
 
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+
     companion object {
         @Volatile var onForegroundReady: (() -> Unit)? = null
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    @Suppress("DEPRECATION")
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val channelId = "screen_mirror_channel"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -912,8 +1234,8 @@ class ProjectionService : Service() {
         }
 
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Screen Mirroring Active")
-            .setContentText("Streaming screen to TV...")
+            .setContentTitle("Movie Cast Active")
+            .setContentText("High-speed hardware streaming to TV...")
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
@@ -924,6 +1246,17 @@ class ProjectionService : Service() {
             } else {
                 startForeground(1, notification)
             }
+
+            // Lock CPU and High-Performance Wi-Fi so MIUI never throttles background streaming
+            val pm = applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MovieCast::StreamWakeLock").apply {
+                acquire(4 * 60 * 60 * 1000L)
+            }
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "MovieCast::StreamWifiLock").apply {
+                acquire()
+            }
+
             val callback = onForegroundReady
             onForegroundReady = null
             callback?.invoke()
@@ -933,12 +1266,19 @@ class ProjectionService : Service() {
 
         return START_NOT_STICKY
     }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (_: Exception) {}
+        try { if (wifiLock?.isHeld == true) wifiLock?.release() } catch (_: Exception) {}
+    }
 }
 
 class StreamWebSocketServer(address: InetSocketAddress) : WebSocketServer(address) {
     private val sockets = CopyOnWriteArrayList<WebSocket>()
     @Volatile private var cachedMime: String? = null
     @Volatile private var cachedInitSegment: ByteArray? = null
+    @Volatile private var droppingUntilKeyframe = false
 
     override fun onOpen(conn: WebSocket?, handshake: ClientHandshake?) {
         if (conn != null) {
@@ -973,6 +1313,12 @@ class StreamWebSocketServer(address: InetSocketAddress) : WebSocketServer(addres
         }
     }
 
+    fun sendCommand(cmd: String) {
+        for (sock in sockets) {
+            try { sock.send(cmd) } catch (_: Exception) {}
+        }
+    }
+
     fun setInitSegment(mime: String, initBytes: ByteArray) {
         cachedMime = mime
         cachedInitSegment = initBytes
@@ -986,9 +1332,17 @@ class StreamWebSocketServer(address: InetSocketAddress) : WebSocketServer(addres
         }
     }
 
-    fun broadcastData(data: ByteArray) {
+    fun broadcastVideoFragment(data: ByteArray, isKeyFrame: Boolean) {
+        if (isKeyFrame) droppingUntilKeyframe = false
+        if (droppingUntilKeyframe) return
+
         for (sock in sockets) {
             try {
+                if (sock.hasBufferedData() && !isKeyFrame) {
+                    // Protect slow Wi-Fi links from building multi-second queues
+                    droppingUntilKeyframe = true
+                    return
+                }
                 sock.send(data)
             } catch (_: Exception) {
                 sockets.remove(sock)
