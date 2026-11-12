@@ -1,9 +1,13 @@
 package com.nightcast.sync
 
 import android.app.Activity
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.Typeface
 import android.hardware.display.DisplayManager
@@ -19,6 +23,7 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.IBinder
 import android.os.Looper
 import android.text.format.Formatter
 import android.util.DisplayMetrics
@@ -36,6 +41,7 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.NotificationCompat
 import org.java_websocket.WebSocket
 import org.java_websocket.handshake.ClientHandshake
 import org.java_websocket.server.WebSocketServer
@@ -47,7 +53,6 @@ import java.io.PrintWriter
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
-import java.nio.ByteBuffer
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import kotlin.math.abs
@@ -303,7 +308,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val mirrorNotice = TextView(this).apply {
-            text = "Hardware H.264 Stream (Max 1080p @ 60FPS).\nAudio stays in your wired earphones."
+            text = "Hardware H.264 Stream (Max 1080p @ 60FPS).\nSupports anything up to 1080p60.\nAudio stays in your wired earphones."
             setTextColor(Color.parseColor("#B0BEC5"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             gravity = Gravity.CENTER
@@ -853,29 +858,62 @@ class MainActivity : AppCompatActivity() {
     }
 }
 
+class ProjectionService : Service() {
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val channelId = "screen_mirror_channel"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                "Screen Mirroring Service",
+                NotificationManager.IMPORTANCE_LOW
+            )
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.createNotificationChannel(channel)
+        }
+
+        val notification = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("Screen Mirroring Active")
+            .setContentText("Streaming screen to TV...")
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        } else {
+            startForeground(1, notification)
+        }
+
+        return START_NOT_STICKY
+    }
+}
+
 class StreamWebSocketServer(address: InetSocketAddress) : WebSocketServer(address) {
     private val sockets = CopyOnWriteArrayList<WebSocket>()
     @Volatile private var cachedMime: String? = null
     @Volatile private var cachedInitSegment: ByteArray? = null
 
-    override fun onOpen(conn: WebSocket, handshake: ClientHandshake?) {
-        sockets.add(conn)
-        val mime = cachedMime
-        val init = cachedInitSegment
-        if (mime != null && init != null) {
-            try {
-                conn.send("MIME:$mime")
-                conn.send(init)
-            } catch (_: Exception) {}
+    override fun onOpen(conn: WebSocket?, handshake: ClientHandshake?) {
+        if (conn != null) {
+            sockets.add(conn)
+            val mime = cachedMime
+            val init = cachedInitSegment
+            if (mime != null && init != null) {
+                try {
+                    conn.send("MIME:$mime")
+                    conn.send(init)
+                } catch (_: Exception) {}
+            }
         }
     }
 
-    override fun onClose(conn: WebSocket, code: Int, reason: String?, remote: Boolean) {
-        sockets.remove(conn)
+    override fun onClose(conn: WebSocket?, code: Int, reason: String?, remote: Boolean) {
+        if (conn != null) sockets.remove(conn)
     }
 
     override fun onMessage(conn: WebSocket?, message: String?) {}
-    override fun onMessage(conn: WebSocket?, message: ByteBuffer?) {}
     override fun onError(conn: WebSocket?, ex: Exception?) {}
     override fun onStart() {}
 
@@ -997,9 +1035,9 @@ class Fmp4StreamMuxer(
     private fun buildInitSegment(sps: ByteArray, pps: ByteArray): ByteArray {
         val ftyp = box(
             "ftyp",
-            "isom".toByteArray(),
+            "isom".toByteArray(Charsets.US_ASCII),
             intBytes(0x200),
-            "isomiso6avc1mp41".toByteArray()
+            "isomiso6avc1mp41".toByteArray(Charsets.US_ASCII)
         )
 
         val unityMatrix = concat(
@@ -1041,9 +1079,9 @@ class Fmp4StreamMuxer(
         val hdlr = fullBox(
             "hdlr", 0, 0,
             intBytes(0),
-            "vide".toByteArray(),
+            "vide".toByteArray(Charsets.US_ASCII),
             ByteArray(12),
-            "VideoHandler\u0000".toByteArray()
+            "VideoHandler\u0000".toByteArray(Charsets.US_ASCII)
         )
 
         val vmhd = fullBox("vmhd", 0, 1, shortBytes(0), ByteArray(6))
@@ -1053,7 +1091,7 @@ class Fmp4StreamMuxer(
 
         val avcC = box(
             "avcC",
-            byteArrayOf(1, sps[1], sps[2], sps[3], 0xFF.toByte(), 0xE1.toByte()),
+            byteArrayOf(1, sps[1], sps[2], sps[3], (-1).toByte(), (-31).toByte()),
             shortBytes(sps.size),
             sps,
             byteArrayOf(1),
@@ -1132,21 +1170,40 @@ class Fmp4StreamMuxer(
 
     private fun box(type: String, vararg payloads: ByteArray): ByteArray {
         val size = 8 + payloads.sumOf { it.size }
-        val buf = ByteBuffer.allocate(size)
-        buf.putInt(size)
-        buf.put(type.toByteArray(Charsets.US_ASCII))
-        for (p in payloads) buf.put(p)
-        return buf.array()
+        val out = ByteArrayOutputStream(size)
+        out.write(intBytes(size))
+        out.write(type.toByteArray(Charsets.US_ASCII))
+        for (p in payloads) out.write(p)
+        return out.toByteArray()
     }
 
     private fun fullBox(type: String, version: Int, flags: Int, vararg payloads: ByteArray): ByteArray {
         val verFlags = (version shl 24) or (flags and 0x00FFFFFF)
-        return box(type, intBytes(verFlags), *payloads)
+        val totalSize = 12 + payloads.sumOf { it.size }
+        val out = ByteArrayOutputStream(totalSize)
+        out.write(intBytes(totalSize))
+        out.write(type.toByteArray(Charsets.US_ASCII))
+        out.write(intBytes(verFlags))
+        for (p in payloads) out.write(p)
+        return out.toByteArray()
     }
 
-    private fun intBytes(v: Int): ByteArray = ByteBuffer.allocate(4).putInt(v).array()
-    private fun shortBytes(v: Int): ByteArray = ByteBuffer.allocate(2).putShort(v.toShort()).array()
-    private fun longBytes(v: Long): ByteArray = ByteBuffer.allocate(8).putLong(v).array()
+    private fun intBytes(v: Int): ByteArray = byteArrayOf(
+        (v shr 24).toByte(),
+        (v shr 16).toByte(),
+        (v shr 8).toByte(),
+        v.toByte()
+    )
+
+    private fun shortBytes(v: Int): ByteArray = byteArrayOf(
+        (v shr 8).toByte(),
+        v.toByte()
+    )
+
+    private fun longBytes(v: Long): ByteArray = byteArrayOf(
+        (v shr 56).toByte(), (v shr 48).toByte(), (v shr 40).toByte(), (v shr 32).toByte(),
+        (v shr 24).toByte(), (v shr 16).toByte(), (v shr 8).toByte(), v.toByte()
+    )
 
     private fun concat(vararg arrays: ByteArray): ByteArray {
         val total = arrays.sumOf { it.size }
