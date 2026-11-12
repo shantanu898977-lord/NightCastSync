@@ -27,6 +27,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.text.format.Formatter
 import android.util.DisplayMetrics
@@ -76,7 +77,7 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var pendingTvCommand: String? = null
     @Volatile private var currentZoomMode: String = "cover"
 
-    // Hardware Encoder Pipeline
+    // Hardware Encoder Pipeline (Supports anything up to 1080p @ 60FPS)
     private lateinit var projectionManager: MediaProjectionManager
     private lateinit var displayManager: DisplayManager
     private var mediaProjection: MediaProjection? = null
@@ -87,8 +88,10 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var currentMode = MODE_OFFLINE_FILE
     private var lastIsLandscape: Boolean? = null
 
-    // Quality Preset: 0 = 720p 60FPS (Smooth Default), 1 = 1080p 60FPS (Max Sharpness), 2 = 720p 30FPS (Weak Wi-Fi)
-    @Volatile private var qualityPreset = 0
+    // YouTube-style quality: 0 = Auto, 360 = 360p, 480 = 480p, 720 = 720p, 1080 = 1080p
+    @Volatile private var selectedQualityHeight = 0
+    @Volatile private var autoTargetHeight = 720
+    private val qualityButtons = mutableMapOf<Int, Button>()
 
     private var audioOffsetMs: Long = 0
     private lateinit var prefs: SharedPreferences
@@ -111,6 +114,7 @@ class MainActivity : AppCompatActivity() {
         private const val REQUEST_PICK_FILE = 1001
         const val HTTP_PORT = 8080
         const val WS_PORT = 8088
+        private const val MAX_FPS = 60
     }
 
     private val projectionCallback = object : MediaProjection.Callback() {
@@ -127,14 +131,14 @@ class MainActivity : AppCompatActivity() {
             val metrics = getRealScreenMetrics()
             val nowLandscape = metrics.widthPixels >= metrics.heightPixels
             if (lastIsLandscape != null && lastIsLandscape != nowLandscape) {
-                mainHandler.removeCallbacks(orientationRestartRunnable)
-                mainHandler.postDelayed(orientationRestartRunnable, 250)
+                mainHandler.removeCallbacks(reconfigureRunnable)
+                mainHandler.postDelayed(reconfigureRunnable, 250)
             }
         }
     }
 
-    private val orientationRestartRunnable = Runnable {
-        if (isMirroring) restartEncoderAndVirtualDisplay()
+    private val reconfigureRunnable = Runnable {
+        if (isMirroring) restartEncoderLive()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -192,7 +196,7 @@ class MainActivity : AppCompatActivity() {
         }
         layout.addView(ipText)
 
-        // TV Screen Size / Zoom Selector (Works for both Live Mirror & Offline Movies)
+        // TV Screen Size / Zoom Selector
         val zoomTitle = TextView(this).apply {
             text = "TV Screen Size (Removes Black Bars):"
             setTextColor(Color.WHITE)
@@ -385,49 +389,43 @@ class MainActivity : AppCompatActivity() {
         }
 
         val qualityLabel = TextView(this).apply {
-            text = "Stream Smoothness / Resolution:"
+            text = "Video Quality (Change Live Anytime Like YouTube):"
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(0, 0, 0, dp(4))
+            setPadding(0, 0, 0, dp(6))
         }
         mirrorControlsLayout.addView(qualityLabel)
 
-        val qualityGroup = RadioGroup(this).apply {
-            orientation = RadioGroup.VERTICAL
-            setPadding(0, 0, 0, dp(10))
+        val qualityRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, dp(12))
         }
-        val q720p60 = RadioButton(this).apply {
-            text = "720p @ 60FPS (Recommended - Zero Lag)"
-            setTextColor(Color.WHITE)
-            id = View.generateViewId()
-            isChecked = true
-        }
-        val q1080p60 = RadioButton(this).apply {
-            text = "1080p @ 60FPS (Max Sharpness - Fast 5GHz Wi-Fi)"
-            setTextColor(Color.WHITE)
-            id = View.generateViewId()
-        }
-        val q720p30 = RadioButton(this).apply {
-            text = "720p @ 30FPS (Data Saver / Weak Wi-Fi)"
-            setTextColor(Color.WHITE)
-            id = View.generateViewId()
-        }
-        qualityGroup.addView(q720p60)
-        qualityGroup.addView(q1080p60)
-        qualityGroup.addView(q720p30)
-        qualityGroup.setOnCheckedChangeListener { _, checkedId ->
-            qualityPreset = when (checkedId) {
-                q1080p60.id -> 1
-                q720p30.id -> 2
-                else -> 0
+
+        fun makeQualityBtn(label: String, heightVal: Int): Button {
+            return Button(this).apply {
+                text = label
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                lp.setMargins(dp(2), 0, dp(2), 0)
+                layoutParams = lp
+                setOnClickListener { selectQuality(heightVal) }
             }
-            if (isMirroring) restartEncoderAndVirtualDisplay()
         }
-        mirrorControlsLayout.addView(qualityGroup)
+
+        val qualities = listOf("Auto" to 0, "360p" to 360, "480p" to 480, "720p" to 720, "1080p" to 1080)
+        for ((label, hVal) in qualities) {
+            val btn = makeQualityBtn(label, hVal)
+            qualityButtons[hVal] = btn
+            qualityRow.addView(btn)
+        }
+        updateQualityButtonStyles()
+        mirrorControlsLayout.addView(qualityRow)
 
         val mirrorNotice = TextView(this).apply {
-            text = "Tip: Rotate your phone horizontally (Fullscreen in browser) and tap 'Fill TV' or 'Cinema+' above so the movie fills the entire TV screen."
+            text = "Supports all videos up to 1080p & up to 60 FPS automatically.\nSwitch to 480p or 360p anytime if Wi-Fi is slow."
             setTextColor(Color.parseColor("#B0BEC5"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             gravity = Gravity.CENTER
@@ -472,6 +470,26 @@ class MainActivity : AppCompatActivity() {
 
         root.addView(layout)
         setContentView(root)
+    }
+
+    private fun selectQuality(heightVal: Int) {
+        selectedQualityHeight = heightVal
+        if (heightVal == 0) autoTargetHeight = 720
+        updateQualityButtonStyles()
+        if (isMirroring) {
+            mainHandler.removeCallbacks(reconfigureRunnable)
+            mainHandler.post(reconfigureRunnable)
+        }
+    }
+
+    private fun updateQualityButtonStyles() {
+        for ((hVal, btn) in qualityButtons) {
+            if (hVal == selectedQualityHeight) {
+                btn.setBackgroundColor(Color.parseColor("#1E88E5"))
+            } else {
+                btn.setBackgroundColor(Color.parseColor("#263238"))
+            }
+        }
     }
 
     private fun setOffset(ms: Long) {
@@ -557,6 +575,10 @@ class MainActivity : AppCompatActivity() {
         return metrics
     }
 
+    private fun getActiveQualityShortSide(): Int {
+        return if (selectedQualityHeight == 0) autoTargetHeight else selectedQualityHeight
+    }
+
     @Suppress("DEPRECATION")
     private fun computeStreamParameters(metrics: DisplayMetrics): Triple<Int, Int, Int> {
         val rawW = metrics.widthPixels
@@ -564,35 +586,48 @@ class MainActivity : AppCompatActivity() {
         val isLandscape = rawW >= rawH
         lastIsLandscape = isLandscape
 
-        val maxLong = if (qualityPreset == 1) 1920 else 1280
-        val maxShort = if (qualityPreset == 1) 1080 else 720
-        val targetFps = if (qualityPreset == 2) 30 else 60
+        val shortSideCap = getActiveQualityShortSide().coerceIn(360, 1080)
+        val longSideCap = when (shortSideCap) {
+            360 -> 640
+            480 -> 848
+            720 -> 1280
+            else -> 1920
+        }
 
-        val maxW = if (isLandscape) maxLong else maxShort
-        val maxH = if (isLandscape) maxShort else maxLong
+        val maxW = if (isLandscape) longSideCap else shortSideCap
+        val maxH = if (isLandscape) shortSideCap else longSideCap
 
+        // Never upscale above native resolution; scale down smoothly to selected quality ceiling
         val scale = minOf(1.0f, maxW.toFloat() / rawW.toFloat(), maxH.toFloat() / rawH.toFloat())
-        // Align to 16-pixel macroblock boundaries for hardware H.264 encoder speed
         val alignedW = (((rawW * scale).toInt() / 16) * 16).coerceAtLeast(320)
         val alignedH = (((rawH * scale).toInt() / 16) * 16).coerceAtLeast(240)
 
         val refreshRate = windowManager.defaultDisplay?.refreshRate?.toInt() ?: 60
-        val fps = refreshRate.coerceIn(24, targetFps)
-        return Triple(alignedW, alignedH, fps)
+        val maxFps = refreshRate.coerceIn(24, MAX_FPS)
+        return Triple(alignedW, alignedH, maxFps)
     }
 
-    private fun createConfiguredEncoder(width: Int, height: Int, fps: Int, bitrate: Int): MediaCodec {
+    private fun getBitrateForQuality(shortSide: Int): Int {
+        return when {
+            shortSide <= 360 -> 900_000    // 0.9 Mbps (Ultra-fast, zero lag on any Wi-Fi)
+            shortSide <= 480 -> 1_500_000  // 1.5 Mbps (DVD smoothness)
+            shortSide <= 720 -> 2_600_000  // 2.6 Mbps (HD clarity without Wi-Fi spikes)
+            else -> 4_500_000              // 4.5 Mbps (1080p Full HD ceiling)
+        }
+    }
+
+    private fun createConfiguredEncoder(width: Int, height: Int, maxFps: Int, bitrate: Int): MediaCodec {
         val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         try {
-            // Try Low-Latency Baseline Profile (0 B-frames) first for zero decode jitter on Samsung TV
             val lowLatencyFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-                setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+                setInteger(MediaFormat.KEY_FRAME_RATE, maxFps)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
                 setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
                 setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel41)
-                setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
+                setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 66_000L)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
                 }
@@ -601,13 +636,12 @@ class MainActivity : AppCompatActivity() {
             codec.configure(lowLatencyFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             return codec
         } catch (_: Exception) {
-            // Fallback to standard format if chipset rejects explicit profile flags
             val basicFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-                setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+                setInteger(MediaFormat.KEY_FRAME_RATE, maxFps)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-                setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
+                setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 66_000L)
             }
             codec.configure(basicFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             return codec
@@ -616,23 +650,18 @@ class MainActivity : AppCompatActivity() {
 
     private fun startHardwareMirroring() {
         val metrics = getRealScreenMetrics()
-        val (width, height, fps) = computeStreamParameters(metrics)
-        val bitrate = when (qualityPreset) {
-            1 -> 6_000_000 // 6 Mbps for 1080p60
-            2 -> 2_500_000 // 2.5 Mbps for 720p30
-            else -> 4_000_000 // 4 Mbps for 720p60 (Fast & sharp)
-        }
+        val (width, height, maxFps) = computeStreamParameters(metrics)
+        val activeShort = getActiveQualityShortSide()
+        val bitrate = getBitrateForQuality(activeShort)
 
         try {
-            wsServer?.clearStreamCache()
-            val codec = createConfiguredEncoder(width, height, fps, bitrate)
+            val codec = createConfiguredEncoder(width, height, maxFps, bitrate)
             val surface = codec.createInputSurface()
             codec.start()
 
             mediaCodec = codec
             encoderSurface = surface
 
-            // Always recreate VirtualDisplay cleanly so orientation changes never letterbox inside portrait
             virtualDisplay?.release()
             virtualDisplay = mediaProjection?.createVirtualDisplay(
                 "MovieCastHwMirror",
@@ -643,12 +672,13 @@ class MainActivity : AppCompatActivity() {
 
             isMirroring = true
             toggleMirrorBtn.text = "Stop Screen Mirroring"
-            val orientLabel = if (width >= height) "Landscape" else "Portrait"
-            mirrorStatusText.text = "Active: ${width}x${height} ($orientLabel) @ ${fps}FPS"
+            val qName = if (selectedQualityHeight == 0) "Auto (${activeShort}p)" else "${activeShort}p"
+            mirrorStatusText.text = "Streaming: $qName (${width}x${height} up to ${maxFps}FPS)"
             mirrorStatusText.setTextColor(Color.parseColor("#4CAF50"))
 
             wsServer?.sendCommand("ZOOM:$currentZoomMode")
-            threadPool.execute { drainEncoder(codec, width, height, fps) }
+            wsServer?.sendCommand("QACTIVE:${selectedQualityHeight}")
+            threadPool.execute { drainEncoder(codec, width, height, maxFps) }
 
         } catch (e: Exception) {
             mirrorStatusText.text = "Encoder error: ${e.message}"
@@ -657,7 +687,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun restartEncoderAndVirtualDisplay() {
+    private fun restartEncoderLive() {
         if (!isMirroring) return
         isMirroring = false
         try {
@@ -672,13 +702,16 @@ class MainActivity : AppCompatActivity() {
         startHardwareMirroring()
     }
 
-    private fun drainEncoder(codec: MediaCodec, width: Int, height: Int, fps: Int) {
+    private fun drainEncoder(codec: MediaCodec, width: Int, height: Int, maxFps: Int) {
         val bufferInfo = MediaCodec.BufferInfo()
-        val muxer = Fmp4StreamMuxer(width, height, fps)
+        val muxer = Fmp4StreamMuxer(width, height, maxFps)
+        val batchBuffer = ByteArrayOutputStream()
+        var lastBatchFlushMs = SystemClock.elapsedRealtime()
+        varcongestionEvents = 0
 
         while (isMirroring && mediaCodec === codec) {
             try {
-                val outputIndex = codec.dequeueOutputBuffer(bufferInfo, 10000)
+                val outputIndex = codec.dequeueOutputBuffer(bufferInfo, 35_000)
                 if (outputIndex >= 0) {
                     val outputBuffer = codec.getOutputBuffer(outputIndex)
                     if (outputBuffer != null && bufferInfo.size > 0) {
@@ -704,14 +737,35 @@ class MainActivity : AppCompatActivity() {
                                 }
                             }
                             if (muxer.isInitialized) {
-                                val fragment = muxer.wrapFrame(rawData, bufferInfo.presentationTimeUs, isKeyFrame)
+                                val fragment = muxer.onEncodedFrame(rawData, bufferInfo.presentationTimeUs, isKeyFrame)
                                 if (fragment != null) {
-                                    wsServer?.broadcastVideoFragment(fragment, isKeyFrame)
+                                    batchBuffer.write(fragment)
                                 }
                             }
                         }
                     }
                     codec.releaseOutputBuffer(outputIndex, false)
+                }
+
+                // Flush accumulated frames every 45ms (~22 batches/sec) to keep Wi-Fi and TV browser smooth
+                val now = SystemClock.elapsedRealtime()
+                if (batchBuffer.size() > 0 && (now - lastBatchFlushMs >= 45 || batchBuffer.size() >= 48 * 1024)) {
+                    val sentCleanly = wsServer?.broadcastBatch(batchBuffer.toByteArray()) ?: true
+                    batchBuffer.reset()
+                    lastBatchFlushMs = now
+
+                    // If Auto Quality is selected and Wi-Fi is congested, step down smoothly
+                    if (!sentCleanly && selectedQualityHeight == 0 && autoTargetHeight > 360) {
+                        varcongestionEvents++
+                        if (varcongestionEvents >= 6) {
+                            varcongestionEvents = 0
+                            autoTargetHeight = if (autoTargetHeight == 720) 480 else 360
+                            mainHandler.post { if (isMirroring) restartEncoderLive() }
+                            break
+                        }
+                    } else if (sentCleanly && varcongestionEvents > 0) {
+                        varcongestionEvents--
+                    }
                 }
             } catch (_: Exception) {
                 break
@@ -749,7 +803,9 @@ class MainActivity : AppCompatActivity() {
     private fun startWebSocketServer() {
         threadPool.execute {
             try {
-                wsServer = StreamWebSocketServer(InetSocketAddress(WS_PORT)).apply {
+                wsServer = StreamWebSocketServer(InetSocketAddress(WS_PORT)) { qualityFromTv ->
+                    mainHandler.post { selectQuality(qualityFromTv) }
+                }.apply {
                     isReuseAddr = true
                     isTcpNoDelay = true
                     start()
@@ -865,19 +921,26 @@ class MainActivity : AppCompatActivity() {
                 body, html { margin:0; padding:0; width:100vw; height:100vh; background:#000; overflow:hidden; font-family:sans-serif; }
                 #stage { width:100vw; height:100vh; display:flex; align-items:center; justify-content:center; overflow:hidden; background:#000; }
                 video { width:100vw; height:100vh; object-fit:cover; background:#000; transition:transform 0.2s ease; }
-                .nav { position:fixed; top:12px; right:12px; z-index:99; background:rgba(15,15,15,0.85); padding:8px 14px; border-radius:8px; transition:opacity 0.4s; color:#fff; font-size:14px; }
-                .nav a, .nav span { color:#fff; text-decoration:none; margin:0 6px; font-weight:bold; cursor:pointer; padding:4px 8px; border-radius:4px; background:#263238; }
+                .nav { position:fixed; top:12px; right:12px; z-index:99; background:rgba(15,15,15,0.88); padding:8px 12px; border-radius:8px; transition:opacity 0.4s; color:#fff; font-size:13px; }
+                .nav a, .nav span { color:#fff; text-decoration:none; margin:0 3px; font-weight:bold; cursor:pointer; padding:5px 8px; border-radius:4px; background:#263238; display:inline-block; }
+                .nav span.active { background:#1E88E5; }
                 .nav.hidden { opacity:0; pointer-events:none; }
-                #statusOverlay { position:fixed; bottom:20px; left:20px; color:#80D8FF; background:rgba(0,0,0,0.7); padding:8px 14px; border-radius:6px; font-size:14px; display:none; z-index:90; }
+                #statusOverlay { position:fixed; bottom:20px; left:20px; color:#80D8FF; background:rgba(0,0,0,0.75); padding:8px 14px; border-radius:6px; font-size:14px; display:none; z-index:90; }
               </style>
             </head>
             <body>
               <div class="nav" id="navbar">
-                <a href="/?view=file">Offline Movie</a>
+                <a href="/?view=file">Offline</a>
                 <a href="/?view=mirror">Live Mirror</a>
+                |
+                <span id="q0" onclick="setQuality(0)">Auto</span>
+                <span id="q360" onclick="setQuality(360)">360p</span>
+                <span id="q480" onclick="setQuality(480)">480p</span>
+                <span id="q720" onclick="setQuality(720)">720p</span>
+                <span id="q1080" onclick="setQuality(1080)">1080p</span>
+                |
                 <span onclick="applyZoom('cover')">Fill TV</span>
                 <span onclick="applyZoom('cinema')">Cinema+</span>
-                <span onclick="applyZoom('fill')">Stretch</span>
                 <span onclick="applyZoom('contain')">Fit</span>
               </div>
               <div id="statusOverlay">Waiting for stream...</div>
@@ -887,16 +950,32 @@ class MainActivity : AppCompatActivity() {
                 const nav = document.getElementById('navbar');
                 const statusBox = document.getElementById('statusOverlay');
                 let navTimer = null;
+                let wsConn = null;
 
                 function wakeNav() {
                   nav.classList.remove('hidden');
                   clearTimeout(navTimer);
-                  navTimer = setTimeout(() => nav.classList.add('hidden'), 4000);
+                  navTimer = setTimeout(() => nav.classList.add('hidden'), 4500);
                 }
                 document.addEventListener('mousemove', wakeNav);
                 document.addEventListener('keydown', wakeNav);
                 document.addEventListener('click', wakeNav);
                 wakeNav();
+
+                function highlightQuality(q) {
+                  [0, 360, 480, 720, 1080].forEach(id => {
+                    const el = document.getElementById('q' + id);
+                    if (el) el.className = (id === q) ? 'active' : '';
+                  });
+                }
+                highlightQuality($selectedQualityHeight);
+
+                function setQuality(q) {
+                  highlightQuality(q);
+                  if (wsConn && wsConn.readyState === 1) {
+                    wsConn.send('QUALITY:' + q);
+                  }
+                }
 
                 function applyZoom(mode) {
                   if (!v) return;
@@ -916,54 +995,54 @@ class MainActivity : AppCompatActivity() {
                 if (view === 'mirror') {
                   let ms = null;
                   let sb = null;
-                  let pendingMime = null;
                   let queue = [];
                   let queueBytes = 0;
                   let isRemoving = false;
+                  let hasStartedPlayback = false;
 
-                  function setupMediaSource() {
+                  function startNewMediaSource(mime) {
                     queue = [];
                     queueBytes = 0;
                     sb = null;
                     isRemoving = false;
+                    hasStartedPlayback = false;
                     ms = new MediaSource();
                     v.src = URL.createObjectURL(ms);
                     ms.addEventListener('sourceopen', () => {
-                      if (pendingMime) initSourceBuffer(pendingMime);
+                      try {
+                        sb = ms.addSourceBuffer(mime);
+                        sb.mode = 'segments';
+                        sb.addEventListener('updateend', onBufferUpdated);
+                        flushQueue();
+                      } catch (e) {}
                     });
-                  }
-
-                  function initSourceBuffer(mime) {
-                    if (sb || !ms || ms.readyState !== 'open') return;
-                    try {
-                      sb = ms.addSourceBuffer(mime);
-                      sb.mode = 'segments';
-                      sb.addEventListener('updateend', onBufferUpdated);
-                      flushQueue();
-                    } catch (e) {}
                   }
 
                   function onBufferUpdated() {
                     isRemoving = false;
-                    if (v.paused) v.play().catch(()=>{});
                     if (v.buffered.length > 0) {
                       const end = v.buffered.end(v.buffered.length - 1);
-                      const lag = end - v.currentTime;
-                      if (lag > 1.8) {
-                        v.currentTime = end - 0.15;
-                        v.playbackRate = 1.0;
-                      } else if (lag > 0.40) {
-                        v.playbackRate = 1.10;
-                      } else if (lag > 0.18) {
-                        v.playbackRate = 1.04;
-                      } else {
-                        v.playbackRate = 1.0;
+                      const bufferedAhead = end - v.currentTime;
+
+                      // Wait for a 220ms cushion before starting playback so it never underruns
+                      if (!hasStartedPlayback && bufferedAhead >= 0.22) {
+                        hasStartedPlayback = true;
+                        v.play().catch(()=>{});
+                      } else if (hasStartedPlayback && v.paused && bufferedAhead >= 0.20) {
+                        v.play().catch(()=>{});
                       }
 
-                      if (v.currentTime > 25 && !sb.updating && queue.length === 0) {
+                      // Keep native 1.0x speed so Tizen hardware decoder never re-clocks/stutters.
+                      // Only jump if lag exceeds 2.0 seconds, keeping a safe 0.30s buffer cushion.
+                      if (bufferedAhead > 2.0) {
+                        v.currentTime = end - 0.30;
+                      }
+
+                      // Trim old buffer only once every 30 seconds
+                      if (v.currentTime > 45 && !sb.updating && queue.length === 0) {
                         try {
                           isRemoving = true;
-                          sb.remove(0, v.currentTime - 10);
+                          sb.remove(0, v.currentTime - 15);
                           return;
                         } catch (e) { isRemoving = false; }
                       }
@@ -974,7 +1053,6 @@ class MainActivity : AppCompatActivity() {
                   function flushQueue() {
                     if (!sb || sb.updating || isRemoving || queue.length === 0) return;
                     try {
-                      // Merge all queued fragments into a single appendBuffer call to eliminate TV CPU lag
                       let payload;
                       if (queue.length === 1) {
                         payload = queue.shift();
@@ -997,23 +1075,21 @@ class MainActivity : AppCompatActivity() {
                     }
                   }
 
-                  setupMediaSource();
-
                   function connectWs() {
-                    const ws = new WebSocket('ws://$ip:$WS_PORT');
-                    ws.binaryType = 'arraybuffer';
-                    ws.onmessage = (e) => {
+                    wsConn = new WebSocket('ws://$ip:$WS_PORT');
+                    wsConn.binaryType = 'arraybuffer';
+                    wsConn.onmessage = (e) => {
                       if (typeof e.data === 'string') {
-                        if (e.data.startsWith('MIME:')) {
-                          pendingMime = e.data.substring(5);
-                          initSourceBuffer(pendingMime);
-                        } else if (e.data === 'RESET') {
-                          setupMediaSource();
+                        if (e.data.startsWith('INIT:')) {
+                          const mime = e.data.substring(5);
+                          startNewMediaSource(mime);
                         } else if (e.data.startsWith('ZOOM:')) {
                           applyZoom(e.data.substring(5));
+                        } else if (e.data.startsWith('QACTIVE:')) {
+                          highlightQuality(parseInt(e.data.substring(8), 10));
                         }
                       } else {
-                        if (queue.length > 45) {
+                        if (queue.length > 60) {
                           queue = [];
                           queueBytes = 0;
                         }
@@ -1022,7 +1098,7 @@ class MainActivity : AppCompatActivity() {
                         flushQueue();
                       }
                     };
-                    ws.onclose = () => setTimeout(connectWs, 800);
+                    wsConn.onclose = () => setTimeout(connectWs, 800);
                   }
                   connectWs();
 
@@ -1235,7 +1311,7 @@ class ProjectionService : Service() {
 
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("Movie Cast Active")
-            .setContentText("High-speed hardware streaming to TV...")
+            .setContentText("Streaming video to TV...")
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
@@ -1247,7 +1323,6 @@ class ProjectionService : Service() {
                 startForeground(1, notification)
             }
 
-            // Lock CPU and High-Performance Wi-Fi so MIUI never throttles background streaming
             val pm = applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager
             wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MovieCast::StreamWakeLock").apply {
                 acquire(4 * 60 * 60 * 1000L)
@@ -1274,11 +1349,14 @@ class ProjectionService : Service() {
     }
 }
 
-class StreamWebSocketServer(address: InetSocketAddress) : WebSocketServer(address) {
+class StreamWebSocketServer(
+    address: InetSocketAddress,
+    private val onQualityRequested: (Int) -> Unit
+) : WebSocketServer(address) {
+
     private val sockets = CopyOnWriteArrayList<WebSocket>()
     @Volatile private var cachedMime: String? = null
     @Volatile private var cachedInitSegment: ByteArray? = null
-    @Volatile private var droppingUntilKeyframe = false
 
     override fun onOpen(conn: WebSocket?, handshake: ClientHandshake?) {
         if (conn != null) {
@@ -1287,7 +1365,7 @@ class StreamWebSocketServer(address: InetSocketAddress) : WebSocketServer(addres
             val init = cachedInitSegment
             if (mime != null && init != null) {
                 try {
-                    conn.send("MIME:$mime")
+                    conn.send("INIT:$mime")
                     conn.send(init)
                 } catch (_: Exception) {}
             }
@@ -1298,19 +1376,19 @@ class StreamWebSocketServer(address: InetSocketAddress) : WebSocketServer(addres
         if (conn != null) sockets.remove(conn)
     }
 
-    override fun onMessage(conn: WebSocket?, message: String?) {}
+    override fun onMessage(conn: WebSocket?, message: String?) {
+        if (message != null && message.startsWith("QUALITY:")) {
+            val q = message.substring(8).toIntOrNull()
+            if (q != null) onQualityRequested(q)
+        }
+    }
+
     override fun onError(conn: WebSocket?, ex: Exception?) {}
     override fun onStart() {}
 
     fun clearStreamCache() {
-        val hadStream = cachedInitSegment != null
         cachedMime = null
         cachedInitSegment = null
-        if (hadStream) {
-            for (sock in sockets) {
-                try { sock.send("RESET") } catch (_: Exception) {}
-            }
-        }
     }
 
     fun sendCommand(cmd: String) {
@@ -1324,7 +1402,7 @@ class StreamWebSocketServer(address: InetSocketAddress) : WebSocketServer(addres
         cachedInitSegment = initBytes
         for (sock in sockets) {
             try {
-                sock.send("MIME:$mime")
+                sock.send("INIT:$mime")
                 sock.send(initBytes)
             } catch (_: Exception) {
                 sockets.remove(sock)
@@ -1332,37 +1410,45 @@ class StreamWebSocketServer(address: InetSocketAddress) : WebSocketServer(addres
         }
     }
 
-    fun broadcastVideoFragment(data: ByteArray, isKeyFrame: Boolean) {
-        if (isKeyFrame) droppingUntilKeyframe = false
-        if (droppingUntilKeyframe) return
-
+    fun broadcastBatch(data: ByteArray): Boolean {
+        var allClean = true
         for (sock in sockets) {
             try {
-                if (sock.hasBufferedData() && !isKeyFrame) {
-                    // Protect slow Wi-Fi links from building multi-second queues
-                    droppingUntilKeyframe = true
-                    return
+                if (sock.hasBufferedData()) {
+                    allClean = false
                 }
                 sock.send(data)
             } catch (_: Exception) {
                 sockets.remove(sock)
             }
         }
+        return allClean
     }
 }
 
+/**
+ * Gapless 1-Frame Lookahead fMP4 Muxer.
+ * Guarantees that every frame's duration equals the exact time until the next frame,
+ * eliminating timeline holes across 24 FPS, 30 FPS, and 60 FPS videos.
+ */
 class Fmp4StreamMuxer(
     private val width: Int,
     private val height: Int,
-    private val fps: Int
+    private val maxFps: Int
 ) {
+    private class PendingFrame(
+        val payload: ByteArray,
+        val ptsUs: Long,
+        val isKeyFrame: Boolean
+    )
+
     @Volatile var isInitialized = false
         private set
 
     private var seqNum = 1
-    private var basePtsUs: Long = -1L
-    private var lastDecode90k: Long = 0L
-    private val defaultDuration90k = 90000 / fps.coerceIn(1, 60)
+    private var accumulatedDecode90k: Long = 0L
+    private var pendingFrame: PendingFrame? = null
+    private val defaultDuration90k = 90000 / maxFps.coerceIn(24, 60)
 
     fun processCodecConfig(annexB: ByteArray): Pair<String, ByteArray>? {
         val nals = splitAnnexBNals(annexB)
@@ -1389,7 +1475,7 @@ class Fmp4StreamMuxer(
         return null
     }
 
-    fun wrapFrame(annexB: ByteArray, ptsUs: Long, isKeyFrame: Boolean): ByteArray? {
+    fun onEncodedFrame(annexB: ByteArray, ptsUs: Long, isKeyFrame: Boolean): ByteArray? {
         val nals = splitAnnexBNals(annexB)
         val avccOut = ByteArrayOutputStream()
         var hasVideoSlice = false
@@ -1403,15 +1489,22 @@ class Fmp4StreamMuxer(
             avccOut.write(nal)
         }
 
-        val payload = avccOut.toByteArray()
-        if (payload.isEmpty() || !hasVideoSlice) return null
+        val currentPayload = avccOut.toByteArray()
+        if (currentPayload.isEmpty() || !hasVideoSlice) return null
 
-        if (basePtsUs < 0L) basePtsUs = ptsUs
-        val current90k = ((ptsUs - basePtsUs).coerceAtLeast(0L) * 90L) / 1000L
-        val decodeTime = if (seqNum == 1) 0L else maxOf(current90k, lastDecode90k + 1)
-        val duration = if (seqNum == 1) defaultDuration90k else (decodeTime - lastDecode90k).toInt().coerceIn(300, 90000)
-        lastDecode90k = decodeTime
+        val prev = pendingFrame
+        pendingFrame = PendingFrame(currentPayload, ptsUs, isKeyFrame)
+        if (prev == null) return null
 
+        val deltaUs = (ptsUs - prev.ptsUs).coerceIn(10_000L, 250_000L)
+        val duration90k = ((deltaUs * 90L) / 1000L).toInt().coerceAtLeast(900)
+        val decodeTime = accumulatedDecode90k
+        accumulatedDecode90k += duration90k
+
+        return buildMoofMdat(prev.payload, decodeTime, duration90k, prev.isKeyFrame)
+    }
+
+    private fun buildMoofMdat(payload: ByteArray, decodeTime: Long, duration: Int, isKeyFrame: Boolean): ByteArray {
         val sampleFlags = if (isKeyFrame) 0x02000000 else 0x01010000
         val mfhd = fullBox("mfhd", 0, 0, intBytes(seqNum++))
         val tfhd = fullBox("tfhd", 0, 0x020000, intBytes(1))
@@ -1427,7 +1520,6 @@ class Fmp4StreamMuxer(
         val traf = box("traf", tfhd, tfdt, trun)
         val moof = box("moof", mfhd, traf)
         val mdat = box("mdat", payload)
-
         return concat(moof, mdat)
     }
 
