@@ -94,6 +94,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var mirrorControlsLayout: LinearLayout
     private lateinit var modeRadioGroup: RadioGroup
     private lateinit var mirrorStatusText: TextView
+    private lateinit var toggleMirrorBtn: Button
 
     companion object {
         const val MODE_OFFLINE_FILE = 0
@@ -103,10 +104,17 @@ class MainActivity : AppCompatActivity() {
         const val HTTP_PORT = 8080
         const val WS_PORT = 8088
 
-        // Hard ceilings: Up to 1080p at up to 60 FPS
         private const val MAX_LONG_SIDE = 1920
         private const val MAX_SHORT_SIDE = 1080
         private const val MAX_FPS = 60
+    }
+
+    private val projectionCallback = object : MediaProjection.Callback() {
+        override fun onStop() {
+            mainHandler.post {
+                stopMirroring()
+            }
+        }
     }
 
     private val displayListener = object : DisplayManager.DisplayListener {
@@ -316,17 +324,15 @@ class MainActivity : AppCompatActivity() {
         }
         mirrorControlsLayout.addView(mirrorNotice)
 
-        val toggleMirrorBtn = Button(this).apply {
+        toggleMirrorBtn = Button(this).apply {
             text = "Start Screen Mirroring"
             setBackgroundColor(Color.parseColor("#C2185B"))
             setTextColor(Color.WHITE)
             setOnClickListener {
                 if (isMirroring) {
                     stopMirroring()
-                    text = "Start Screen Mirroring"
                 } else {
                     startActivityForResult(projectionManager.createScreenCaptureIntent(), REQUEST_MEDIA_PROJECTION)
-                    text = "Stop Screen Mirroring"
                 }
             }
         }
@@ -372,6 +378,7 @@ class MainActivity : AppCompatActivity() {
         startActivityForResult(intent, REQUEST_PICK_FILE)
     }
 
+    @Suppress("DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQUEST_PICK_FILE && resultCode == Activity.RESULT_OK) {
@@ -382,19 +389,37 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Exception) {}
             statusText.text = "Loaded: ${uri.lastPathSegment ?: "Movie ready"}"
             initLocalAudioPlayer(uri)
-        } else if (requestCode == REQUEST_MEDIA_PROJECTION && resultCode == Activity.RESULT_OK) {
-            val serviceIntent = Intent(this, ProjectionService::class.java).apply {
-                putExtra("code", resultCode)
-                putExtra("data", data)
+        } else if (requestCode == REQUEST_MEDIA_PROJECTION && resultCode == Activity.RESULT_OK && data != null) {
+            mirrorStatusText.text = "Starting foreground service..."
+            mirrorStatusText.setTextColor(Color.parseColor("#FFD54F"))
+
+            // Wait until ProjectionService confirms startForeground() before calling getMediaProjection()
+            ProjectionService.onForegroundReady = {
+                mainHandler.post {
+                    try {
+                        val projection = projectionManager.getMediaProjection(resultCode, data)
+                        if (projection != null) {
+                            projection.registerCallback(projectionCallback, mainHandler)
+                            mediaProjection = projection
+                            startHardwareMirroring()
+                        } else {
+                            mirrorStatusText.text = "Projection permission unavailable"
+                            mirrorStatusText.setTextColor(Color.RED)
+                        }
+                    } catch (e: Exception) {
+                        mirrorStatusText.text = "Projection error: ${e.message}"
+                        mirrorStatusText.setTextColor(Color.RED)
+                        stopMirroring()
+                    }
+                }
             }
+
+            val serviceIntent = Intent(this, ProjectionService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(serviceIntent)
             } else {
                 startService(serviceIntent)
             }
-
-            mediaProjection = projectionManager.getMediaProjection(resultCode, data!!)
-            startHardwareMirroring()
         }
     }
 
@@ -463,6 +488,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             isMirroring = true
+            toggleMirrorBtn.text = "Stop Screen Mirroring"
             mirrorStatusText.text = "Mirroring: Active (${width}x${height} @ ${fps}FPS)"
             mirrorStatusText.setTextColor(Color.parseColor("#4CAF50"))
 
@@ -537,6 +563,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun stopMirroring() {
         isMirroring = false
+        ProjectionService.onForegroundReady = null
         wsServer?.clearStreamCache()
         try {
             virtualDisplay?.release()
@@ -546,13 +573,19 @@ class MainActivity : AppCompatActivity() {
             mediaCodec = null
             encoderSurface?.release()
             encoderSurface = null
+            mediaProjection?.unregisterCallback(projectionCallback)
             mediaProjection?.stop()
             mediaProjection = null
             stopService(Intent(this, ProjectionService::class.java))
         } catch (_: Exception) {}
 
-        mirrorStatusText.text = "Mirroring: Stopped"
-        mirrorStatusText.setTextColor(Color.GRAY)
+        if (::toggleMirrorBtn.isInitialized) {
+            toggleMirrorBtn.text = "Start Screen Mirroring"
+        }
+        if (::mirrorStatusText.isInitialized) {
+            mirrorStatusText.text = "Mirroring: Stopped"
+            mirrorStatusText.setTextColor(Color.GRAY)
+        }
     }
 
     private fun startWebSocketServer() {
@@ -859,6 +892,11 @@ class MainActivity : AppCompatActivity() {
 }
 
 class ProjectionService : Service() {
+
+    companion object {
+        @Volatile var onForegroundReady: (() -> Unit)? = null
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -880,10 +918,17 @@ class ProjectionService : Service() {
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-        } else {
-            startForeground(1, notification)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+            } else {
+                startForeground(1, notification)
+            }
+            val callback = onForegroundReady
+            onForegroundReady = null
+            callback?.invoke()
+        } catch (_: Exception) {
+            stopSelf()
         }
 
         return START_NOT_STICKY
